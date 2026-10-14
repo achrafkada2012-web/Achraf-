@@ -1,0 +1,104 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # تفعيل الاتصال عن بعد وتخطي جدار الحماية بويندوز
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # مسح أي قواعد قديمة لعدم حدوث تعارض في الاتصال
+          netsh advfirewall firewall delete rule name="RDP-Network"
+          
+          # فتح المنفذ الافتراضي 3389 لاستقبال اتصالات نفق Ngrok الخارجى
+          netsh advfirewall firewall add rule name="RDP-Network" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # إعادة تشغيل خدمة الـ RDP لتطبيق التغييرات
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          # تعيين كلمة مرور قوية وثابتة تظهر بوضوح ولا يتم حجبها بـ فلاتر الحماية
+          \$password = "KamelRDP@2026!"
+          securePass = ConvertTo-SecureString password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password \$securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Download and Extract Ngrok
+        run: |
+          # تحميل الأداة الرسمية لفتح النفق المباشر
+          Invoke-WebRequest "https://equinox.io" -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath "\$env:USERPROFILE"
+          Remove-Item ngrok.zip
+          Copy-Item "\(env:USERPROFILE\ngrok.exe" "\)env:GITHUB_WORKSPACE"
+
+      - name: Authenticate Ngrok
+        run: |
+          \$ErrorActionPreference = "Stop"
+          # ربط السيرفر بحساب الـ Token المضاف في إعدادات مستودع GitHub
+          .\ngrok.exe config add-authtoken "\${{ secrets.NGROK_AUTH_TOKEN }}"
+
+      - name: Start Ngrok Tunnel
+        run: |
+          # تشغيل خط الاتصال بالخلفية وتوجيهه للمنفذ 3389
+          Start-Process -FilePath "\$pwd\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -NoNewWindow -RedirectStandardOutput ngrok.log
+
+          \$tunnelUrl = \(null\)timeout = 60
+
+          # فحص ذكي واستخراج تلقائي لعنوان الـ IP المباشر بدون مشاكل الصياغة البرمجية
+          while (timeout -gt 0 -and -not tunnelUrl) {
+            Start-Sleep -Seconds 5
+            \$timeout -= 5
+            try {
+              \$response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+              tunnelUrl = response.tunnels[0].public_url -replace "tcp://", ""
+            } catch {
+              \$logContent = Get-Content ngrok.log -ErrorAction SilentlyContinue
+              if (\$logContent -match "url=tcp://(?<url>[a-zA-Z0-9\.\-]+:\d+)") {
+                  tunnelUrl = Matches['url']
+              }
+            }
+          }
+
+          if (-not \$tunnelUrl) {
+            Write-Output "::error::Ngrok tunnel could not be established"
+            exit 1
+          }
+
+          Write-Output "============================================"
+          Write-Output "||     ✅ RDP CONNECTION DETAILS         ||"
+          Write-Output "============================================"
+          Write-Output "Address: \$tunnelUrl"
+          Write-Output "Username: RDP"
+          Write-Output "Password: KamelRDP@2026!"
+          Write-Output "--------------------------------------------"
+          Write-Output "Instructions:"
+          Write-Output "قم بنسخ الرابط الموضح في خانة Address وضعه مباشرة في تطبيق الـ RDP على هاتفك"
+          Write-Output "============================================"
+
+          # الحفاظ على تشغيل السيرفر مفتوحاً 
+          while (\$true) { Start-Sleep -Seconds 300 }
+
+      - name: Cleanup Ngrok
+        if: always()
+        run: |
+          Stop-Process -Name "ngrok" -Force -ErrorAction SilentlyContinue
